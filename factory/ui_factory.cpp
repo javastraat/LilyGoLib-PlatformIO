@@ -139,32 +139,41 @@ void ui_factory_exit(lv_obj_t *parent)
 // -------------------------------------------------------
 // UniversalMesh screen
 // -------------------------------------------------------
+
+#define UM_NODE_NAME   "lora-pager"
+#define UM_HB_INTERVAL 60000UL
+#define UM_LOG_ROWS    6
+
+LV_FONT_DECLARE(font_alibaba_40);
+
+// --- ARDUINO-only mesh state ---
 #ifdef ARDUINO
-
-#define UM_NODE_NAME    "lora-pager"
-#define UM_HB_INTERVAL  60000UL
-#define UM_LOG_ROWS     6
-
 enum UMState { UM_DISCOVERING, UM_CONNECTED, UM_NO_COORD };
-
 static UniversalMesh     um_mesh;
 static volatile UMState  um_state       = UM_DISCOVERING;
 static uint8_t           um_myMac[6]    = {};
 static uint8_t           um_coordMac[6] = {};
 static uint8_t           um_channel     = 0;
 static unsigned long     um_lastHB      = 0;
-static lv_timer_t       *um_timer       = NULL;
 static TaskHandle_t      um_task        = NULL;
 static SemaphoreHandle_t um_mutex       = NULL;
-
 static char    um_log[UM_LOG_ROWS][72]  = {};
 static uint8_t um_logHead               = 0;
 static uint8_t um_logCount              = 0;
+#endif
 
-static lv_obj_t *um_root       = NULL;
-static lv_obj_t *um_status_lbl = NULL;
-static lv_obj_t *um_info_lbl   = NULL;
-static lv_obj_t *um_log_cont   = NULL;
+// --- Shared LVGL state ---
+static lv_timer_t *um_timer      = NULL;
+static lv_timer_t *um_boot_timer = NULL;
+static lv_obj_t   *um_root       = NULL;
+static lv_obj_t   *um_boot_cont  = NULL;
+static lv_obj_t   *um_status_lbl = NULL;
+static lv_obj_t   *um_info_lbl   = NULL;
+static lv_obj_t   *um_log_cont   = NULL;
+static uint8_t     um_dotPhase   = 0;
+
+// ---- ARDUINO mesh helpers ----
+#ifdef ARDUINO
 
 static void um_log_push(const char *line)
 {
@@ -226,27 +235,26 @@ static void um_discovery_task(void *param)
              um_myMac[3], um_myMac[4], um_myMac[5]);
     um_log_push(line);
 
-    // Announce presence - same as sensor_node
     um_mesh.send(um_coordMac, MESH_TYPE_PING, 0x00,
                  (const uint8_t *)UM_NODE_NAME, strlen(UM_NODE_NAME), 4);
     um_mesh.send(um_coordMac, MESH_TYPE_DATA, 0x06,
                  (const uint8_t *)UM_NODE_NAME, strlen(UM_NODE_NAME), 4);
     um_log_push("Announced. Listening...");
 
-    um_lastHB = millis() - UM_HB_INTERVAL;  // fire HB on first tick
+    um_lastHB = millis() - UM_HB_INTERVAL;
     um_state  = UM_CONNECTED;
     um_task   = NULL;
     vTaskDelete(NULL);
 }
 
-static uint8_t um_dotPhase = 0;
+#endif  // ARDUINO
 
+// ---- Mesh screen LVGL refresh (500ms timer) ----
 static void universalmesh_timer_callback(lv_timer_t *t)
 {
-    // Only drive mesh ops once connected (avoids racing with begin() in task)
+#ifdef ARDUINO
     if (um_state == UM_CONNECTED) {
         um_mesh.update();
-
         unsigned long now = millis();
         if (now - um_lastHB >= UM_HB_INTERVAL) {
             um_lastHB = now;
@@ -258,7 +266,6 @@ static void universalmesh_timer_callback(lv_timer_t *t)
         }
     }
 
-    // Status label
     if (um_status_lbl) {
         if (um_state == UM_DISCOVERING) {
             static const char *dots[] = {".", "..", "..."};
@@ -276,7 +283,6 @@ static void universalmesh_timer_callback(lv_timer_t *t)
         }
     }
 
-    // Info label: channel + own MAC
     if (um_info_lbl && um_state == UM_CONNECTED) {
         char buf[56];
         snprintf(buf, sizeof(buf), "Ch:%d  %02X:%02X:%02X:%02X:%02X:%02X",
@@ -287,7 +293,6 @@ static void universalmesh_timer_callback(lv_timer_t *t)
         lv_obj_set_style_text_color(um_info_lbl, lv_color_make(150, 150, 150), LV_PART_MAIN);
     }
 
-    // Rebuild traffic log from ring buffer
     if (um_log_cont && um_mutex) {
         lv_obj_clean(um_log_cont);
         if (xSemaphoreTake(um_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
@@ -301,17 +306,29 @@ static void universalmesh_timer_callback(lv_timer_t *t)
             xSemaphoreGive(um_mutex);
         }
     }
+#else
+    // Emulator: static status
+    if (um_status_lbl) {
+        lv_label_set_text(um_status_lbl, "Emulator");
+        lv_obj_set_style_text_color(um_status_lbl, lv_color_make(100, 100, 100), LV_PART_MAIN);
+    }
+#endif
 }
 
+// ---- Cleanup (called from exit event or app exit) ----
 static void um_cleanup(void)
 {
-    if (um_timer) { lv_timer_del(um_timer); um_timer = NULL; }
-    if (um_task)  { vTaskDelete(um_task);   um_task  = NULL; }
-    if (um_mutex) { vSemaphoreDelete(um_mutex); um_mutex = NULL; }
+    if (um_boot_timer) { lv_timer_del(um_boot_timer); um_boot_timer = NULL; }
+    if (um_timer)      { lv_timer_del(um_timer);      um_timer      = NULL; }
+#ifdef ARDUINO
+    if (um_task)  { vTaskDelete(um_task);          um_task  = NULL; }
+    if (um_mutex) { vSemaphoreDelete(um_mutex);    um_mutex = NULL; }
+#endif
     um_status_lbl = NULL;
     um_info_lbl   = NULL;
     um_log_cont   = NULL;
-    if (um_root)  { lv_obj_del(um_root); um_root = NULL; }
+    if (um_boot_cont) { lv_obj_del(um_boot_cont); um_boot_cont = NULL; }
+    if (um_root)      { lv_obj_del(um_root);       um_root      = NULL; }
 }
 
 static void um_exit_event_cb(lv_event_t *e)
@@ -322,24 +339,9 @@ static void um_exit_event_cb(lv_event_t *e)
     set_low_power_mode_flag(true);
 }
 
-void ui_universalmesh_enter(lv_obj_t *parent)
+// ---- Build the live mesh screen (called after boot logo) ----
+static void um_build_mesh_ui(void)
 {
-    if (um_timer) return;
-
-    um_state    = UM_DISCOVERING;
-    um_channel  = 0;
-    um_logHead  = 0;
-    um_logCount = 0;
-    um_dotPhase = 0;
-    memset(um_myMac, 0, sizeof(um_myMac));
-    memset(um_coordMac, 0, sizeof(um_coordMac));
-
-    disable_input_devices();
-    set_low_power_mode_flag(false);
-
-    um_mutex = xSemaphoreCreateMutex();
-
-    // Full-screen black container with column flex layout
     um_root = lv_obj_create(lv_scr_act());
     lv_obj_set_size(um_root, lv_pct(100), lv_pct(100));
     lv_obj_center(um_root);
@@ -362,13 +364,21 @@ void ui_universalmesh_enter(lv_obj_t *parent)
     lv_obj_set_flex_align(hdr, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(hdr, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *title = lv_label_create(hdr);
-    lv_label_set_text(title, LV_SYMBOL_WIFI " UniversalMesh");
-    lv_obj_set_style_text_color(title, lv_color_make(0, 200, 255), LV_PART_MAIN);
+    lv_obj_t *hdr_title = lv_label_create(hdr);
+    lv_label_set_text(hdr_title, LV_SYMBOL_WIFI " UniversalMesh");
+    lv_obj_set_style_text_color(hdr_title, lv_color_make(0, 200, 255), LV_PART_MAIN);
 
     um_status_lbl = lv_label_create(hdr);
-    lv_label_set_text(um_status_lbl, "Scanning.");
+    lv_label_set_text(um_status_lbl, "...");
     lv_obj_set_style_text_color(um_status_lbl, lv_color_make(255, 160, 0), LV_PART_MAIN);
+
+    // Exit button — power icon, top-right corner
+    lv_obj_t *exit_btn = lv_label_create(hdr);
+    lv_label_set_text(exit_btn, LV_SYMBOL_POWER);
+    lv_obj_set_style_text_color(exit_btn, lv_color_make(160, 50, 50), LV_PART_MAIN);
+    lv_obj_add_flag(exit_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_text_color(exit_btn, lv_color_make(220, 70, 70), LV_STATE_PRESSED);
+    lv_obj_add_event(exit_btn, um_exit_event_cb, LV_EVENT_CLICKED, NULL);
 
     // Thin divider
     lv_obj_t *div = lv_obj_create(um_root);
@@ -390,7 +400,7 @@ void ui_universalmesh_enter(lv_obj_t *parent)
     lv_obj_set_style_border_width(div2, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(div2, 0, LV_PART_MAIN);
 
-    // Traffic log container - expands to fill remaining height
+    // Traffic log - expands to fill remaining height
     um_log_cont = lv_obj_create(um_root);
     lv_obj_set_width(um_log_cont, lv_pct(100));
     lv_obj_set_flex_grow(um_log_cont, 1);
@@ -402,14 +412,91 @@ void ui_universalmesh_enter(lv_obj_t *parent)
     lv_obj_clear_flag(um_log_cont, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_group_add_obj(lv_group_get_default(), um_root);
-    lv_obj_add_event(um_root, um_exit_event_cb, LV_EVENT_CLICKED, NULL);
 
-    // Background task for blocking channel scan
+#ifdef ARDUINO
+    um_mutex = xSemaphoreCreateMutex();
     xTaskCreate(um_discovery_task, "um_disc", 4096, NULL, 5, &um_task);
+#else
+    // Emulator: populate log with static hint
+    lv_obj_t *el = lv_label_create(um_log_cont);
+    lv_label_set_text(el, "ESP-NOW not available in emulator");
+    lv_obj_set_style_text_color(el, lv_color_make(80, 80, 80), LV_PART_MAIN);
+    lv_obj_set_width(el, lv_pct(100));
+#endif
 
-    // 500ms refresh timer
     um_timer = lv_timer_create(universalmesh_timer_callback, 500, NULL);
     lv_timer_ready(um_timer);
+}
+
+// ---- Boot logo timer fires after 5 s ----
+static void um_boot_done_cb(lv_timer_t *t)
+{
+    um_boot_timer = NULL;  // auto-deleted by LVGL (repeat_count = 1)
+    if (um_boot_cont) {
+        lv_obj_del(um_boot_cont);
+        um_boot_cont = NULL;
+    }
+    um_build_mesh_ui();
+}
+
+void ui_universalmesh_enter(lv_obj_t *parent)
+{
+    if (um_boot_timer || um_timer) return;
+
+    um_dotPhase = 0;
+#ifdef ARDUINO
+    um_state    = UM_DISCOVERING;
+    um_channel  = 0;
+    um_logHead  = 0;
+    um_logCount = 0;
+    memset(um_myMac, 0, sizeof(um_myMac));
+    memset(um_coordMac, 0, sizeof(um_coordMac));
+#endif
+
+    disable_input_devices();
+    set_low_power_mode_flag(false);
+
+    // ---- Boot logo (works in both ARDUINO and emulator) ----
+    um_boot_cont = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(um_boot_cont, lv_pct(100), lv_pct(100));
+    lv_obj_center(um_boot_cont);
+    lv_obj_set_style_bg_color(um_boot_cont, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_border_width(um_boot_cont, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(um_boot_cont, 0, LV_PART_MAIN);
+    lv_obj_set_flex_flow(um_boot_cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(um_boot_cont, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(um_boot_cont, 10, LV_PART_MAIN);
+    lv_obj_clear_flag(um_boot_cont, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Big title in Alibaba 40pt
+    lv_obj_t *logo_title = lv_label_create(um_boot_cont);
+    lv_label_set_text(logo_title, "UniversalMesh");
+    lv_obj_set_style_text_font(logo_title, &font_alibaba_40, LV_PART_MAIN);
+    lv_obj_set_style_text_color(logo_title, lv_color_make(0, 210, 255), LV_PART_MAIN);
+
+    // Accent line
+    lv_obj_t *accent = lv_obj_create(um_boot_cont);
+    lv_obj_set_size(accent, 300, 2);
+    lv_obj_set_style_bg_color(accent, lv_color_make(0, 90, 140), LV_PART_MAIN);
+    lv_obj_set_style_border_width(accent, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(accent, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(accent, 1, LV_PART_MAIN);
+
+    // Subtitle
+    lv_obj_t *sub = lv_label_create(um_boot_cont);
+    lv_label_set_text(sub, "ESP-NOW Mesh Network");
+    lv_obj_set_style_text_color(sub, lv_color_make(90, 90, 90), LV_PART_MAIN);
+    lv_obj_set_style_text_font(sub, &lv_font_montserrat_16, LV_PART_MAIN);
+
+    // Node name
+    lv_obj_t *node = lv_label_create(um_boot_cont);
+    lv_label_set_text(node, UM_NODE_NAME);
+    lv_obj_set_style_text_color(node, lv_color_make(50, 50, 50), LV_PART_MAIN);
+    lv_obj_set_style_text_font(node, &lv_font_montserrat_12, LV_PART_MAIN);
+
+    // 5-second one-shot timer → transition to mesh screen
+    um_boot_timer = lv_timer_create(um_boot_done_cb, 5000, NULL);
+    lv_timer_set_repeat_count(um_boot_timer, 1);
 }
 
 void ui_universalmesh_exit(lv_obj_t *parent)
@@ -417,14 +504,6 @@ void ui_universalmesh_exit(lv_obj_t *parent)
     um_cleanup();
     enable_input_devices();
 }
-
-#else  // emulator stubs
-
-static void universalmesh_timer_callback(lv_timer_t *t) {}
-void ui_universalmesh_enter(lv_obj_t *parent) {}
-void ui_universalmesh_exit(lv_obj_t *parent) {}
-
-#endif  // ARDUINO
 
 app_t ui_factory_main = {
     .setup_func_cb = ui_factory_enter,

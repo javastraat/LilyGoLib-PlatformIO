@@ -1,0 +1,7 @@
+{
+  "name": "UniversalMesh",
+  "version": "1.0.0",
+  "description": "UniversalMesh ESP-NOW mesh network library",
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}
